@@ -27,6 +27,7 @@ package net.runelite.client.plugins.gpu;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
 import net.runelite.client.config.Range;
 import static net.runelite.client.plugins.gpu.GpuPlugin.MAX_DISTANCE;
 import static net.runelite.client.plugins.gpu.GpuPlugin.MAX_FOG_DEPTH;
@@ -38,6 +39,15 @@ import net.runelite.client.plugins.gpu.config.UIScalingMode;
 public interface GpuPluginConfig extends Config
 {
 	String GROUP = "gpu";
+	String SKYBOX_SECTION = "skyboxSection";
+
+	@ConfigSection(
+		name = "Skybox",
+		description = "Skybox and panorama settings.",
+		position = 15,
+		closedByDefault = false
+	)
+	String skyboxSection = SKYBOX_SECTION;
 
 	@Range(
 		max = MAX_DISTANCE
@@ -230,5 +240,105 @@ public interface GpuPluginConfig extends Config
 	default boolean removeVertexSnapping()
 	{
 		return true;
+	}
+
+	@ConfigItem(
+		keyName = "customSkybox",
+		name = "Custom Skybox",
+		description = "Use a custom panorama instead of RuneLite's scene skybox.",
+		position = 15,
+		section = SKYBOX_SECTION
+	)
+	default boolean customSkybox()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "skyboxFile",
+		name = "Skybox file",
+		description = "PNG file in .runelite/gpu-sky used for the overworld panorama. Leave blank to use the bundled skybox.",
+		position = 17,
+		section = SKYBOX_SECTION
+	)
+	default String skyboxFile()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "caveSkyboxFile",
+		name = "Cave skybox file",
+		description = "PNG file in .runelite/gpu-sky used in caves. Leave blank to use the overworld skybox.",
+		position = 18,
+		section = SKYBOX_SECTION
+	)
+	default String caveSkyboxFile()
+	{
+		return "";
+	}
+
+	@Range(
+		min = 60,
+		max = 120
+	)
+	@ConfigItem(
+		keyName = "skyboxHorizontalFov",
+		name = "Sky horizontal FOV",
+		description = "Horizontal field of view used for projecting the panorama.",
+		position = 19,
+		section = SKYBOX_SECTION
+	)
+	default int skyboxHorizontalFov()
+	{
+		return 105;
+	}
+
+	@Range(
+		min = -180,
+		max = 180
+	)
+	@ConfigItem(
+		keyName = "skyboxYawOffset",
+		name = "Sky yaw offset",
+		description = "Rotates the panorama left or right, in degrees.",
+		position = 20,
+		section = SKYBOX_SECTION
+	)
+	default int skyboxYawOffset()
+	{
+		return 160;
+	}
+
+	@Range(
+		min = -5,
+		max = 5
+	)
+	@ConfigItem(
+		keyName = "skyboxPitchOffset",
+		name = "Sky pitch offset",
+		description = "Moves the panorama up or down, in degrees.",
+		position = 21,
+		section = SKYBOX_SECTION
+	)
+	default int skyboxPitchOffset()
+	{
+		return 5;
+	}
+
+	@Range(
+		min = 10,
+		max = 300
+	)
+	@ConfigItem(
+		keyName = "skyboxExposure",
+		name = "Sky exposure",
+		description = "Brightness multiplier for the panorama.",
+		position = 22,
+		section = SKYBOX_SECTION
+	)
+	default int skyboxExposure()
+	{
+		return 110;
 	}
 }

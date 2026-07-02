@@ -30,10 +30,20 @@
 #include colorblind_mode
 
 uniform sampler2DArray textures;
+uniform sampler2D skyboxFogTexture;
 uniform float brightness;
 uniform float smoothBanding;
 uniform vec4 fogColor;
 uniform float textureLightMode;
+uniform int useSkyboxFog;
+uniform vec4 skyboxFogViewport;
+uniform float skyboxFogCameraYaw;
+uniform float skyboxFogCameraPitch;
+uniform float skyboxFogHorizontalFov;
+uniform float skyboxFogAspect;
+uniform float skyboxFogYawOffset;
+uniform float skyboxFogPitchOffset;
+uniform float skyboxFogExposure;
 
 in vec4 fColor;
 noperspective centroid in float fHsl;
@@ -45,6 +55,12 @@ in float fDepth;
 #endif
 
 out vec4 FragColor;
+
+const float PI = 3.14159265358979323846;
+const float TWO_PI = 6.28318530717958647692;
+const float SKYBOX_FOG_MIP_LEVEL = 7.0;
+const float SKYBOX_FOG_SAMPLE_STEP_U = 0.025;
+const float SKYBOX_FOG_SAMPLE_STEP_V = 0.018;
 
 #include "hsl_to_rgb.glsl"
 
@@ -59,6 +75,45 @@ float linear_depth(float depth) {
   return 1 - z / 10000;  // we don't have a far plane, but the client uses 10000
 }
 #endif
+
+vec3 sampleSkyboxFogAverage(float u, float v) {
+  vec3 color = textureLod(skyboxFogTexture, vec2(u, clamp(v, 0.0, 1.0)), SKYBOX_FOG_MIP_LEVEL).rgb * 4.0;
+  color += textureLod(skyboxFogTexture, vec2(u - SKYBOX_FOG_SAMPLE_STEP_U, clamp(v, 0.0, 1.0)), SKYBOX_FOG_MIP_LEVEL).rgb;
+  color += textureLod(skyboxFogTexture, vec2(u + SKYBOX_FOG_SAMPLE_STEP_U, clamp(v, 0.0, 1.0)), SKYBOX_FOG_MIP_LEVEL).rgb;
+  color += textureLod(skyboxFogTexture, vec2(u, clamp(v - SKYBOX_FOG_SAMPLE_STEP_V, 0.0, 1.0)), SKYBOX_FOG_MIP_LEVEL).rgb;
+  color += textureLod(skyboxFogTexture, vec2(u, clamp(v + SKYBOX_FOG_SAMPLE_STEP_V, 0.0, 1.0)), SKYBOX_FOG_MIP_LEVEL).rgb;
+  return color * 0.125;
+}
+
+vec3 sampleSkyboxFogColor() {
+  vec2 viewportUv = clamp((gl_FragCoord.xy - skyboxFogViewport.xy) / max(skyboxFogViewport.zw, vec2(1.0)), vec2(0.0), vec2(1.0));
+  vec2 screen = viewportUv * 2.0 - 1.0;
+  float halfHorizontalFov = skyboxFogHorizontalFov * 0.5;
+  float halfVerticalFov = atan(tan(halfHorizontalFov) / max(skyboxFogAspect, 0.1));
+  vec3 ray = normalize(vec3(
+    screen.x * tan(halfHorizontalFov),
+    screen.y * tan(halfVerticalFov),
+    1.0
+  ));
+
+  float pitchAngle = skyboxFogCameraPitch + skyboxFogPitchOffset;
+  float pitchSin = sin(pitchAngle);
+  float pitchCos = cos(pitchAngle);
+  ray = vec3(ray.x, ray.y * pitchCos - ray.z * pitchSin, ray.y * pitchSin + ray.z * pitchCos);
+
+  float yawAngle = skyboxFogCameraYaw + skyboxFogYawOffset;
+  float yawSin = sin(yawAngle);
+  float yawCos = cos(yawAngle);
+  ray = vec3(ray.x * yawCos + ray.z * yawSin, ray.y, ray.z * yawCos - ray.x * yawSin);
+
+  float yaw = atan(ray.x, ray.z);
+  float pitch = asin(clamp(ray.y, -1.0, 1.0));
+
+  float u = yaw / TWO_PI;
+  float v = clamp(0.5 + pitch / PI, 0.0, 1.0);
+  vec3 color = sampleSkyboxFogAverage(u, v);
+  return vec3(1.0) - exp(-color * skyboxFogExposure);
+}
 
 void main() {
   vec4 c;
@@ -91,7 +146,8 @@ void main() {
   c.rgb = colorblind(c.rgb);
 #endif
 
-  vec3 mixedColor = mix(c.rgb, fogColor.rgb, fFogAmount);
+  vec3 targetFogColor = useSkyboxFog != 0 && fFogAmount > 0.0 ? sampleSkyboxFogColor() : fogColor.rgb;
+  vec3 mixedColor = mix(c.rgb, targetFogColor, fFogAmount);
   FragColor = vec4(mixedColor, c.a);
 
 #ifdef FRAG_UVS

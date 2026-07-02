@@ -34,13 +34,26 @@ import java.awt.Image;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.imageio.ImageIO;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
@@ -52,6 +65,7 @@ import net.runelite.api.GameObject;
 import net.runelite.api.GameState;
 import net.runelite.api.Model;
 import net.runelite.api.Perspective;
+import net.runelite.api.Player;
 import net.runelite.api.Projection;
 import net.runelite.api.Renderable;
 import net.runelite.api.Scene;
@@ -59,9 +73,11 @@ import net.runelite.api.TextureProvider;
 import net.runelite.api.TileObject;
 import net.runelite.api.WorldEntity;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.PostClientTick;
 import net.runelite.api.hooks.DrawCallbacks;
+import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.config.ConfigManager;
@@ -119,6 +135,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private GpuPluginConfig config;
 
 	@Inject
+	private ConfigManager configManager;
+
+	@Inject
 	private TextureManager textureManager;
 
 	@Inject
@@ -148,11 +167,39 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		.add(GL_VERTEX_SHADER, "vertui.glsl")
 		.add(GL_FRAGMENT_SHADER, "fragui.glsl");
 
+	static final Shader SKYBOX_PROGRAM = new Shader()
+		.add(GL_VERTEX_SHADER, "skybox.vert.glsl")
+		.add(GL_FRAGMENT_SHADER, "skybox.frag.glsl");
+
+	private static final int SKYBOX_TEXTURE_WIDTH = 2048;
+	private static final int SKYBOX_TEXTURE_HEIGHT = 1024;
+	private static final float SKYBOX_YAW_COUNTER_ROTATION = 1.0f;
+	private static final float SKYBOX_PITCH_COUNTER_ROTATION = 1.0f;
+	private static final double SKYBOX_FOG_CENTER_V = 0.5;
+	private static final double SKYBOX_FOG_BAND_HEIGHT = 0.08;
+	private static final int SKYBOX_FILE_WATCH_SECONDS = 1;
+	private static final String SKYBOX_DIR_NAME = "gpu-sky";
+
 	static int glProgram;
 	private int glUiProgram;
+	private int glSkyboxProgram;
 
 	private int interfaceTexture;
 	private int interfacePbo;
+	private final SkyboxTexture overworldSkybox = new SkyboxTexture("overworld");
+	private final SkyboxTexture caveSkybox = new SkyboxTexture("cave");
+	private ScheduledExecutorService skyboxLoader;
+	private ScheduledFuture<?> skyboxWatcher;
+	private final AtomicInteger skyboxLoadGeneration = new AtomicInteger();
+	private SkyboxFileSnapshot skyboxFileSnapshot = SkyboxFileSnapshot.empty();
+	private SkyboxFileSnapshot pendingSkyboxFileSnapshot = SkyboxFileSnapshot.empty();
+	private float skyboxReferenceScale = Float.NaN;
+	private int skyboxReferenceViewportWidth = -1;
+	private int skyboxReferenceViewportHeight = -1;
+	private float skyboxYaw = Float.NaN;
+	private float skyboxPitch = Float.NaN;
+	private float lastSkyboxCameraYaw = Float.NaN;
+	private float lastSkyboxCameraPitch = Float.NaN;
 
 	private int vaoUiHandle;
 	private int vboUiHandle;
@@ -182,6 +229,149 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 	private SceneUploader clientUploader, mapUploader;
 	private FacePrioritySorter facePrioritySorter;
+
+	private static final class SkyboxTexture
+	{
+		private final String name;
+		private int texture = -1;
+		private boolean hasFogColor;
+		private float fogRed;
+		private float fogGreen;
+		private float fogBlue;
+
+		private SkyboxTexture(String name)
+		{
+			this.name = name;
+		}
+
+		private void clear()
+		{
+			texture = -1;
+			clearFogColor();
+		}
+
+		private void clearFogColor()
+		{
+			hasFogColor = false;
+			fogRed = 0;
+			fogGreen = 0;
+			fogBlue = 0;
+		}
+	}
+
+	private static final class LoadedSkyboxImage
+	{
+		private final boolean configured;
+		private final String configuredPath;
+		private final BufferedImage image;
+
+		private LoadedSkyboxImage(boolean configured, String configuredPath, BufferedImage image)
+		{
+			this.configured = configured;
+			this.configuredPath = configuredPath;
+			this.image = image;
+		}
+	}
+
+	private static final class SkyboxFileState
+	{
+		private static final SkyboxFileState UNCONFIGURED = new SkyboxFileState(false, false, 0, 0);
+
+		private final boolean configured;
+		private final boolean exists;
+		private final long modifiedTime;
+		private final long size;
+
+		private SkyboxFileState(boolean configured, boolean exists, long modifiedTime, long size)
+		{
+			this.configured = configured;
+			this.exists = exists;
+			this.modifiedTime = modifiedTime;
+			this.size = size;
+		}
+
+		private static SkyboxFileState missing()
+		{
+			return new SkyboxFileState(true, false, 0, 0);
+		}
+
+		private static SkyboxFileState existing(Path path) throws IOException
+		{
+			return new SkyboxFileState(true, true,
+				Files.getLastModifiedTime(path).toMillis(),
+				Files.size(path));
+		}
+
+		@Override
+		public boolean equals(Object o)
+		{
+			if (this == o)
+			{
+				return true;
+			}
+			if (!(o instanceof SkyboxFileState))
+			{
+				return false;
+			}
+			SkyboxFileState that = (SkyboxFileState) o;
+			return configured == that.configured
+				&& exists == that.exists
+				&& modifiedTime == that.modifiedTime
+				&& size == that.size;
+		}
+
+		@Override
+		public int hashCode()
+		{
+			return Objects.hash(configured, exists, modifiedTime, size);
+		}
+	}
+
+	private static final class SkyboxFileSnapshot
+	{
+		private final String skyboxFile;
+		private final SkyboxFileState skyboxState;
+		private final String caveSkyboxFile;
+		private final SkyboxFileState caveSkyboxState;
+
+		private SkyboxFileSnapshot(String skyboxFile, SkyboxFileState skyboxState,
+			String caveSkyboxFile, SkyboxFileState caveSkyboxState)
+		{
+			this.skyboxFile = skyboxFile;
+			this.skyboxState = skyboxState;
+			this.caveSkyboxFile = caveSkyboxFile;
+			this.caveSkyboxState = caveSkyboxState;
+		}
+
+		private static SkyboxFileSnapshot empty()
+		{
+			return new SkyboxFileSnapshot(null, SkyboxFileState.UNCONFIGURED, null, SkyboxFileState.UNCONFIGURED);
+		}
+
+		@Override
+		public boolean equals(Object o)
+		{
+			if (this == o)
+			{
+				return true;
+			}
+			if (!(o instanceof SkyboxFileSnapshot))
+			{
+				return false;
+			}
+			SkyboxFileSnapshot that = (SkyboxFileSnapshot) o;
+			return Objects.equals(skyboxFile, that.skyboxFile)
+				&& Objects.equals(skyboxState, that.skyboxState)
+				&& Objects.equals(caveSkyboxFile, that.caveSkyboxFile)
+				&& Objects.equals(caveSkyboxState, that.caveSkyboxState);
+		}
+
+		@Override
+		public int hashCode()
+		{
+			return Objects.hash(skyboxFile, skyboxState, caveSkyboxFile, caveSkyboxState);
+		}
+	}
 
 	static class SceneContext
 	{
@@ -267,6 +457,24 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private int uniTick;
 	private int uniColorblindIntensity;
 	private int uniUiColorblindIntensity;
+	private int uniSkyboxTexture;
+	private int uniSkyboxCameraYaw;
+	private int uniSkyboxCameraPitch;
+	private int uniSkyboxHorizontalFov;
+	private int uniSkyboxAspect;
+	private int uniSkyboxYawOffset;
+	private int uniSkyboxPitchOffset;
+	private int uniSkyboxExposure;
+	private int uniSkyboxFogTexture;
+	private int uniUseSkyboxFog;
+	private int uniSkyboxFogViewport;
+	private int uniSkyboxFogCameraYaw;
+	private int uniSkyboxFogCameraPitch;
+	private int uniSkyboxFogHorizontalFov;
+	private int uniSkyboxFogAspect;
+	private int uniSkyboxFogYawOffset;
+	private int uniSkyboxFogPitchOffset;
+	private int uniSkyboxFogExposure;
 	static int uniBase;
 
 	static final float[] IDENTITY = Mat4.identity();
@@ -274,11 +482,13 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	protected void startUp()
 	{
+		migrateSkyboxModeConfig();
 		root = new SceneContext(NUM_ZONES, NUM_ZONES);
 		subs = new SceneContext[MAX_WORLDVIEWS];
 		clientUploader = new SceneUploader(renderCallbackManager);
 		mapUploader = new SceneUploader(renderCallbackManager);
 		facePrioritySorter = new FacePrioritySorter(clientUploader);
+		skyboxLoader = Executors.newSingleThreadScheduledExecutor(GpuPlugin::newSkyboxLoaderThread);
 		clientThread.invoke(() ->
 		{
 			try
@@ -353,6 +563,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				initVao();
 				initProgram();
 				initInterfaceTexture();
+				initSkyboxTextures();
+				scheduleSkyboxFileReload();
+				startSkyboxFileWatcher();
 				if (glCapabilities.OpenGL45)
 				{
 					glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE); // 1 near 0 far
@@ -423,6 +636,21 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	protected void shutDown()
 	{
+		skyboxLoadGeneration.incrementAndGet();
+		ScheduledFuture<?> watcher = skyboxWatcher;
+		if (watcher != null)
+		{
+			watcher.cancel(true);
+			skyboxWatcher = null;
+		}
+
+		ScheduledExecutorService loader = skyboxLoader;
+		if (loader != null)
+		{
+			loader.shutdownNow();
+			skyboxLoader = null;
+		}
+
 		clientThread.invoke(() ->
 		{
 			client.setGpuFlags(0);
@@ -440,6 +668,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 				root.free();
 
+				shutdownSkyboxTexture();
 				shutdownInterfaceTexture();
 				shutdownProgram();
 				shutdownVao();
@@ -472,6 +701,21 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		return configManager.getConfig(GpuPluginConfig.class);
 	}
 
+	private void migrateSkyboxModeConfig()
+	{
+		String skyboxMode = configManager.getConfiguration(GpuPluginConfig.GROUP, "skyboxMode");
+		if (skyboxMode == null)
+		{
+			return;
+		}
+
+		if (configManager.getConfiguration(GpuPluginConfig.GROUP, "customSkybox") == null)
+		{
+			configManager.setConfiguration(GpuPluginConfig.GROUP, "customSkybox", "PANORAMA".equals(skyboxMode));
+		}
+		configManager.unsetConfiguration(GpuPluginConfig.GROUP, "skyboxMode");
+	}
+
 	@Subscribe
 	public void onConfigChanged(ConfigChanged configChanged)
 	{
@@ -502,6 +746,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					| (config.removeVertexSnapping() ? DrawCallbacks.NO_VERTEX_SNAPPING : 0)
 					| DrawCallbacks.ZBUF
 				);
+			}
+			else if (configChanged.getKey().equals("skyboxFile")
+				|| configChanged.getKey().equals("caveSkyboxFile"))
+			{
+				scheduleSkyboxFileReload();
 			}
 			else if (configChanged.getKey().equals("uiScalingMode") || configChanged.getKey().equals("colorBlindMode"))
 			{
@@ -577,6 +826,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		Template template = createTemplate();
 		glProgram = PROGRAM.compile(template);
 		glUiProgram = UI_PROGRAM.compile(template);
+		glSkyboxProgram = SKYBOX_PROGRAM.compile(template);
 
 		glBindVertexArray(0);
 
@@ -602,12 +852,31 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		uniTextureAnimations = glGetUniformLocation(glProgram, "textureAnimations");
 		uniBase = glGetUniformLocation(glProgram, "base");
 		uniColorblindIntensity = glGetUniformLocation(glProgram, "colorblindIntensity");
+		uniSkyboxFogTexture = glGetUniformLocation(glProgram, "skyboxFogTexture");
+		uniUseSkyboxFog = glGetUniformLocation(glProgram, "useSkyboxFog");
+		uniSkyboxFogViewport = glGetUniformLocation(glProgram, "skyboxFogViewport");
+		uniSkyboxFogCameraYaw = glGetUniformLocation(glProgram, "skyboxFogCameraYaw");
+		uniSkyboxFogCameraPitch = glGetUniformLocation(glProgram, "skyboxFogCameraPitch");
+		uniSkyboxFogHorizontalFov = glGetUniformLocation(glProgram, "skyboxFogHorizontalFov");
+		uniSkyboxFogAspect = glGetUniformLocation(glProgram, "skyboxFogAspect");
+		uniSkyboxFogYawOffset = glGetUniformLocation(glProgram, "skyboxFogYawOffset");
+		uniSkyboxFogPitchOffset = glGetUniformLocation(glProgram, "skyboxFogPitchOffset");
+		uniSkyboxFogExposure = glGetUniformLocation(glProgram, "skyboxFogExposure");
 
 		uniTex = glGetUniformLocation(glUiProgram, "tex");
 		uniTexTargetDimensions = glGetUniformLocation(glUiProgram, "targetDimensions");
 		uniTexSourceDimensions = glGetUniformLocation(glUiProgram, "sourceDimensions");
 		uniUiAlphaOverlay = glGetUniformLocation(glUiProgram, "alphaOverlay");
 		uniUiColorblindIntensity = glGetUniformLocation(glUiProgram, "colorblindIntensity");
+
+		uniSkyboxTexture = glGetUniformLocation(glSkyboxProgram, "skyboxTexture");
+		uniSkyboxCameraYaw = glGetUniformLocation(glSkyboxProgram, "cameraYaw");
+		uniSkyboxCameraPitch = glGetUniformLocation(glSkyboxProgram, "cameraPitch");
+		uniSkyboxHorizontalFov = glGetUniformLocation(glSkyboxProgram, "horizontalFov");
+		uniSkyboxAspect = glGetUniformLocation(glSkyboxProgram, "aspect");
+		uniSkyboxYawOffset = glGetUniformLocation(glSkyboxProgram, "yawOffset");
+		uniSkyboxPitchOffset = glGetUniformLocation(glSkyboxProgram, "pitchOffset");
+		uniSkyboxExposure = glGetUniformLocation(glSkyboxProgram, "exposure");
 	}
 
 	private void shutdownProgram()
@@ -617,6 +886,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 		glDeleteProgram(glUiProgram);
 		glUiProgram = 0;
+
+		glDeleteProgram(glSkyboxProgram);
+		glSkyboxProgram = 0;
 	}
 
 	private void initVao()
@@ -721,6 +993,512 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		glDeleteBuffers(interfacePbo);
 		glDeleteTextures(interfaceTexture);
 		interfaceTexture = -1;
+	}
+
+	private static Thread newSkyboxLoaderThread(Runnable runnable)
+	{
+		Thread thread = new Thread(runnable, "gpu-skybox-loader");
+		thread.setDaemon(true);
+		return thread;
+	}
+
+	private void initSkyboxTextures()
+	{
+		initSkyboxTexture(overworldSkybox, null, true);
+		deleteSkyboxTexture(caveSkybox);
+	}
+
+	private void scheduleSkyboxFileReload()
+	{
+		ScheduledExecutorService loader = skyboxLoader;
+		if (loader == null || loader.isShutdown())
+		{
+			return;
+		}
+
+		final int generation = skyboxLoadGeneration.incrementAndGet();
+		final String skyboxFile = config.skyboxFile();
+		final String caveSkyboxFile = config.caveSkyboxFile();
+		try
+		{
+			loader.submit(() ->
+			{
+				pendingSkyboxFileSnapshot = SkyboxFileSnapshot.empty();
+				loadSkyboxFiles(generation, skyboxFile, caveSkyboxFile);
+			});
+		}
+		catch (RejectedExecutionException ex)
+		{
+			log.debug("Skybox reload skipped because the loader is shutting down", ex);
+		}
+	}
+
+	private void startSkyboxFileWatcher()
+	{
+		ScheduledExecutorService loader = skyboxLoader;
+		if (loader == null || loader.isShutdown() || skyboxWatcher != null)
+		{
+			return;
+		}
+
+		skyboxWatcher = loader.scheduleWithFixedDelay(this::checkSkyboxFilesForChanges,
+			SKYBOX_FILE_WATCH_SECONDS, SKYBOX_FILE_WATCH_SECONDS, TimeUnit.SECONDS);
+	}
+
+	private void checkSkyboxFilesForChanges()
+	{
+		try
+		{
+			SkyboxFileSnapshot snapshot = snapshotSkyboxFiles(config.skyboxFile(), config.caveSkyboxFile());
+			if (snapshot.equals(skyboxFileSnapshot))
+			{
+				pendingSkyboxFileSnapshot = SkyboxFileSnapshot.empty();
+				return;
+			}
+
+			if (!snapshot.equals(pendingSkyboxFileSnapshot))
+			{
+				pendingSkyboxFileSnapshot = snapshot;
+				return;
+			}
+
+			pendingSkyboxFileSnapshot = SkyboxFileSnapshot.empty();
+			int generation = skyboxLoadGeneration.incrementAndGet();
+			log.debug("Detected skybox file change; reloading");
+			loadSkyboxFiles(generation, snapshot.skyboxFile, snapshot.caveSkyboxFile);
+		}
+		catch (Exception ex)
+		{
+			log.debug("Unable to check skybox files for changes", ex);
+		}
+	}
+
+	private void loadSkyboxFiles(int generation, String skyboxFile, String caveSkyboxFile)
+	{
+		ensureSkyboxDirectory();
+		LoadedSkyboxImage overworldImage = loadConfiguredSkyboxImage("overworld", skyboxFile);
+		LoadedSkyboxImage caveImage = loadConfiguredSkyboxImage("cave", caveSkyboxFile);
+		skyboxFileSnapshot = snapshotSkyboxFiles(skyboxFile, caveSkyboxFile);
+
+		clientThread.invokeLater(() ->
+		{
+			if (generation != skyboxLoadGeneration.get() || !lwjglInitted)
+			{
+				return;
+			}
+
+			reloadSkyboxTextures(overworldImage, caveImage);
+		});
+	}
+
+	private SkyboxFileSnapshot snapshotSkyboxFiles(String skyboxFile, String caveSkyboxFile)
+	{
+		String trimmedSkyboxFile = trimToNull(skyboxFile);
+		String trimmedCaveSkyboxFile = trimToNull(caveSkyboxFile);
+		return new SkyboxFileSnapshot(
+			trimmedSkyboxFile,
+			snapshotSkyboxFile("overworld", trimmedSkyboxFile),
+			trimmedCaveSkyboxFile,
+			snapshotSkyboxFile("cave", trimmedCaveSkyboxFile));
+	}
+
+	private SkyboxFileState snapshotSkyboxFile(String label, String configuredPath)
+	{
+		if (configuredPath == null)
+		{
+			return SkyboxFileState.UNCONFIGURED;
+		}
+
+		Path path = resolveSkyboxPath(label, configuredPath, false);
+		if (path == null)
+		{
+			return SkyboxFileState.missing();
+		}
+
+		try
+		{
+			return SkyboxFileState.existing(path);
+		}
+		catch (IOException ex)
+		{
+			log.debug("Unable to snapshot {} skybox file {}", label, path, ex);
+			return SkyboxFileState.missing();
+		}
+	}
+
+	private LoadedSkyboxImage loadConfiguredSkyboxImage(String label, String configuredPath)
+	{
+		String trimmedPath = trimToNull(configuredPath);
+		if (trimmedPath == null)
+		{
+			return new LoadedSkyboxImage(false, null, null);
+		}
+
+		Path path = resolveSkyboxPath(label, trimmedPath, true);
+		if (path == null)
+		{
+			return new LoadedSkyboxImage(true, trimmedPath, null);
+		}
+
+		try
+		{
+			BufferedImage image = ImageIO.read(path.toFile());
+			if (image == null)
+			{
+				log.warn("Unable to decode {} skybox file {}", label, path);
+				return new LoadedSkyboxImage(true, trimmedPath, null);
+			}
+
+			log.debug("Loaded {} skybox file {} {}x{}", label, path, image.getWidth(), image.getHeight());
+			return new LoadedSkyboxImage(true, trimmedPath, image);
+		}
+		catch (IOException ex)
+		{
+			log.warn("Unable to load {} skybox file {}", label, path, ex);
+			return new LoadedSkyboxImage(true, trimmedPath, null);
+		}
+	}
+
+	private void ensureSkyboxDirectory()
+	{
+		try
+		{
+			Files.createDirectories(getSkyboxDirectory());
+		}
+		catch (InvalidPathException | IOException ex)
+		{
+			log.warn("Unable to create skybox directory", ex);
+		}
+	}
+
+	private static Path getSkyboxDirectory()
+	{
+		return RuneLite.RUNELITE_DIR.toPath().resolve(SKYBOX_DIR_NAME).normalize();
+	}
+
+	private Path resolveSkyboxPath(String label, String configuredPath, boolean warn)
+	{
+		try
+		{
+			Path skyboxDir = getSkyboxDirectory();
+			Files.createDirectories(skyboxDir);
+			Path realSkyboxDir = skyboxDir.toRealPath();
+			Path path = skyboxDir.resolve(configuredPath).normalize();
+			if (!Files.isRegularFile(path))
+			{
+				if (warn)
+				{
+					log.warn("{} skybox file does not exist: {}", label, path);
+				}
+				return null;
+			}
+
+			Path realPath = path.toRealPath();
+			if (!realPath.startsWith(realSkyboxDir))
+			{
+				if (warn)
+				{
+					log.warn("{} skybox file must be inside {}", label, realSkyboxDir);
+				}
+				return null;
+			}
+
+			return realPath;
+		}
+		catch (InvalidPathException | IOException ex)
+		{
+			if (warn)
+			{
+				log.warn("Unable to resolve {} skybox path {}", label, configuredPath, ex);
+			}
+			return null;
+		}
+	}
+
+	private static String trimToNull(String value)
+	{
+		if (value == null)
+		{
+			return null;
+		}
+
+		String trimmed = value.trim();
+		return trimmed.isEmpty() ? null : trimmed;
+	}
+
+	private void reloadSkyboxTextures(LoadedSkyboxImage overworldImage, LoadedSkyboxImage caveImage)
+	{
+		if (overworldImage.configured && overworldImage.image != null)
+		{
+			replaceSkyboxTexture(overworldSkybox, overworldImage.image);
+		}
+		else
+		{
+			if (overworldImage.configured)
+			{
+				log.warn("Using bundled skybox because the configured overworld skybox failed to load: {}",
+					overworldImage.configuredPath);
+			}
+			replaceSkyboxTexture(overworldSkybox, null);
+		}
+
+		if (caveImage.configured && caveImage.image != null)
+		{
+			replaceSkyboxTexture(caveSkybox, caveImage.image);
+		}
+		else
+		{
+			if (caveImage.configured)
+			{
+				log.warn("Using overworld skybox in caves because the configured cave skybox failed to load: {}",
+					caveImage.configuredPath);
+			}
+			deleteSkyboxTexture(caveSkybox);
+		}
+	}
+
+	private void replaceSkyboxTexture(SkyboxTexture skybox, BufferedImage image)
+	{
+		deleteSkyboxTexture(skybox);
+		initSkyboxTexture(skybox, image, image == null);
+	}
+
+	private void initSkyboxTexture(SkyboxTexture skybox, BufferedImage image, boolean useBundledFallback)
+	{
+		skybox.clearFogColor();
+		skybox.texture = glGenTextures();
+		glBindTexture(GL_TEXTURE_2D, skybox.texture);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+		if (image != null)
+		{
+			computeSkyboxFogColor(skybox, image);
+			uploadSkyboxImage(image);
+			glBindTexture(GL_TEXTURE_2D, 0);
+			return;
+		}
+
+		if (useBundledFallback && loadSkyboxResource(skybox))
+		{
+			glBindTexture(GL_TEXTURE_2D, 0);
+			return;
+		}
+
+		if (useBundledFallback)
+		{
+			uploadGeneratedSkybox(skybox);
+			glBindTexture(GL_TEXTURE_2D, 0);
+			return;
+		}
+
+		glBindTexture(GL_TEXTURE_2D, 0);
+		deleteSkyboxTexture(skybox);
+	}
+
+	private boolean loadSkyboxResource(SkyboxTexture skybox)
+	{
+		try (InputStream in = GpuPlugin.class.getResourceAsStream("skybox.png"))
+		{
+			if (in == null)
+			{
+				return false;
+			}
+
+			BufferedImage image = ImageIO.read(in);
+			if (image == null)
+			{
+				log.warn("Unable to decode skybox.png; using generated sky");
+				return false;
+			}
+
+			computeSkyboxFogColor(skybox, image);
+			uploadSkyboxImage(image);
+			log.debug("Loaded bundled skybox.png {}x{}", image.getWidth(), image.getHeight());
+			return true;
+		}
+		catch (Exception ex)
+		{
+			log.warn("Unable to load skybox.png; using generated sky", ex);
+			return false;
+		}
+	}
+
+	private void uploadGeneratedSkybox(SkyboxTexture skybox)
+	{
+		ByteBuffer pixels = ByteBuffer.allocateDirect(SKYBOX_TEXTURE_WIDTH * SKYBOX_TEXTURE_HEIGHT * 4);
+		double fogRed = 0;
+		double fogGreen = 0;
+		double fogBlue = 0;
+		int fogSamples = 0;
+		for (int y = 0; y < SKYBOX_TEXTURE_HEIGHT; y++)
+		{
+			double altitude = y / (double) (SKYBOX_TEXTURE_HEIGHT - 1);
+			double horizon = Math.exp(-Math.pow((altitude - .32) * 7.5, 2));
+			double upper = Math.pow(altitude, .8);
+			boolean fogSampleRow = isSkyboxFogSampleRow(y, SKYBOX_TEXTURE_HEIGHT);
+
+			for (int x = 0; x < SKYBOX_TEXTURE_WIDTH; x++)
+			{
+				double azimuth = x / (double) (SKYBOX_TEXTURE_WIDTH - 1);
+				double sunWrapDistance = Math.abs(azimuth - .12);
+				sunWrapDistance = Math.min(sunWrapDistance, 1.0 - sunWrapDistance);
+				double sun = Math.exp(-(
+					Math.pow(sunWrapDistance / .014, 2) +
+					Math.pow((altitude - .66) / .045, 2)));
+				double clouds = Math.max(0,
+					Math.sin((azimuth * 5.0 + Math.sin(altitude * 8.0) * .12) * Math.PI * 2.0) * .5 + .5 - .72);
+				clouds *= Math.exp(-Math.pow((altitude - .48) * 5.0, 2));
+
+				double r = .04 + upper * .08 + horizon * .95 + sun * 2.6 + clouds * .55;
+				double g = .12 + upper * .22 + horizon * .54 + sun * 2.0 + clouds * .52;
+				double b = .26 + upper * .66 + horizon * .18 + sun * .72 + clouds * .58;
+
+				putToneMappedRgba(pixels, r, g, b);
+				if (fogSampleRow)
+				{
+					fogRed += toneMappedSrgb(r);
+					fogGreen += toneMappedSrgb(g);
+					fogBlue += toneMappedSrgb(b);
+					fogSamples++;
+				}
+			}
+		}
+		setSkyboxFogColor(skybox, fogRed, fogGreen, fogBlue, fogSamples);
+		pixels.flip();
+
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SKYBOX_TEXTURE_WIDTH, SKYBOX_TEXTURE_HEIGHT, 0,
+			GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+		glGenerateMipmap(GL_TEXTURE_2D);
+	}
+
+	private void uploadSkyboxImage(BufferedImage image)
+	{
+		int width = image.getWidth();
+		int height = image.getHeight();
+		int[] argb = new int[width * height];
+		image.getRGB(0, 0, width, height, argb, 0, width);
+
+		ByteBuffer pixels = ByteBuffer.allocateDirect(width * height * 4);
+		for (int y = 0; y < height; y++)
+		{
+			int srcRow = height - 1 - y;
+			for (int x = 0; x < width; x++)
+			{
+				int pixel = argb[srcRow * width + x];
+				pixels.put((byte) (pixel >> 16));
+				pixels.put((byte) (pixel >> 8));
+				pixels.put((byte) pixel);
+				pixels.put((byte) (pixel >> 24));
+			}
+		}
+		pixels.flip();
+
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+		glGenerateMipmap(GL_TEXTURE_2D);
+	}
+
+	private void computeSkyboxFogColor(SkyboxTexture skybox, BufferedImage image)
+	{
+		int width = image.getWidth();
+		int height = image.getHeight();
+		double red = 0;
+		double green = 0;
+		double blue = 0;
+		double weight = 0;
+
+		for (int y = 0; y < height; y++)
+		{
+			if (!isSkyboxFogSampleRow(y, height))
+			{
+				continue;
+			}
+
+			for (int x = 0; x < width; x++)
+			{
+				int pixel = image.getRGB(x, y);
+				double alpha = (pixel >>> 24) / 255.0;
+				if (alpha <= 0)
+				{
+					continue;
+				}
+
+				red += ((pixel >> 16) & 0xFF) / 255.0 * alpha;
+				green += ((pixel >> 8) & 0xFF) / 255.0 * alpha;
+				blue += (pixel & 0xFF) / 255.0 * alpha;
+				weight += alpha;
+			}
+		}
+
+		setSkyboxFogColor(skybox, red, green, blue, weight);
+	}
+
+	private static boolean isSkyboxFogSampleRow(int y, int height)
+	{
+		double v = y / (double) Math.max(1, height - 1);
+		return Math.abs(v - SKYBOX_FOG_CENTER_V) <= SKYBOX_FOG_BAND_HEIGHT * 0.5;
+	}
+
+	private void setSkyboxFogColor(SkyboxTexture skybox, double red, double green, double blue, double samples)
+	{
+		skybox.hasFogColor = samples > 0;
+		if (!skybox.hasFogColor)
+		{
+			return;
+		}
+
+		skybox.fogRed = (float) (red / samples);
+		skybox.fogGreen = (float) (green / samples);
+		skybox.fogBlue = (float) (blue / samples);
+		log.debug("{} skybox fog color: {}", skybox.name, String.format("#%02X%02X%02X",
+			toByte(skybox.fogRed),
+			toByte(skybox.fogGreen),
+			toByte(skybox.fogBlue)));
+	}
+
+	private static void putToneMappedRgba(ByteBuffer pixels, double r, double g, double b)
+	{
+		pixels.put((byte) toByte(toneMappedSrgb(r)));
+		pixels.put((byte) toByte(toneMappedSrgb(g)));
+		pixels.put((byte) toByte(toneMappedSrgb(b)));
+		pixels.put((byte) 0xFF);
+	}
+
+	private static double toneMappedSrgb(double value)
+	{
+		return Math.pow(clamp01(1.0 - Math.exp(-value)), 1.0 / 2.2);
+	}
+
+	private static int toByte(double value)
+	{
+		return (int) Math.round(clamp01(value) * 255.0);
+	}
+
+	private static float exposedSkyboxColor(float color, float exposure)
+	{
+		return (float) (1.0 - Math.exp(-color * exposure));
+	}
+
+	private static double clamp01(double value)
+	{
+		return Math.max(0, Math.min(1, value));
+	}
+
+	private void shutdownSkyboxTexture()
+	{
+		deleteSkyboxTexture(overworldSkybox);
+		deleteSkyboxTexture(caveSkybox);
+	}
+
+	private void deleteSkyboxTexture(SkyboxTexture skybox)
+	{
+		if (skybox.texture != -1)
+		{
+			glDeleteTextures(skybox.texture);
+		}
+		skybox.clear();
 	}
 
 	private void initFbo(int width, int height, int aaSamples)
@@ -885,6 +1663,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fboScene);
 		}
 
+		final int sky = client.getSkyboxColor();
+		final boolean drawPanoramaSkybox = config.customSkybox();
+
 		// Setup anisotropic filtering
 		final int anisotropicFilteringLevel = config.anisotropicFilteringLevel();
 
@@ -920,16 +1701,24 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			renderWidthOff = (int) Math.floor(scaleFactorX * (renderWidthOff)) - padding;
 		}
 
-		glDpiAwareViewport(renderWidthOff, renderCanvasHeight - renderViewportHeight - renderHeightOff, renderViewportWidth, renderViewportHeight);
+		int renderViewportX = renderWidthOff;
+		int renderViewportY = renderCanvasHeight - renderViewportHeight - renderHeightOff;
+		glDpiAwareViewport(renderViewportX, renderViewportY, renderViewportWidth, renderViewportHeight);
+
+		if (drawPanoramaSkybox)
+		{
+			clearScene(sky);
+			drawPanoramaSkybox(renderViewportWidth, renderViewportHeight, cameraPitch, cameraYaw);
+		}
 
 		glUseProgram(glProgram);
 
 		// Setup uniforms
 		final int drawDistance = getDrawDistance();
 		final int fogDepth = config.fogDepth();
-		final int sky = client.getSkyboxColor();
 		glUniform1i(uniUseFog, fogDepth > 0 ? 1 : 0);
-		glUniform4f(uniFogColor, (sky >> 16 & 0xFF) / 255f, (sky >> 8 & 0xFF) / 255f, (sky & 0xFF) / 255f, 1f);
+		setFogColor(sky, drawPanoramaSkybox);
+		setSkyboxFogUniforms(drawPanoramaSkybox, renderViewportX, renderViewportY, renderViewportWidth, renderViewportHeight);
 		glUniform1i(uniFogDepth, fogDepth);
 		glUniform1i(uniDrawDistance, drawDistance * Perspective.LOCAL_TILE_SIZE);
 		glUniform1i(uniExpandedMapLoadingChunks, client.getExpandedMapLoading());
@@ -973,9 +1762,89 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		glDepthFunc(GL_GREATER);
 		glEnable(GL_DEPTH_TEST);
 
-		drawSkybox(scene, sky, cameraX, cameraY, cameraZ);
+		if (!drawPanoramaSkybox)
+		{
+			drawSkybox(scene, sky, cameraX, cameraY, cameraZ);
+		}
 
 		checkGLErrors();
+	}
+
+	private void clearScene(int sky)
+	{
+		glClearColor((sky >> 16 & 0xFF) / 255f, (sky >> 8 & 0xFF) / 255f, (sky & 0xFF) / 255f, 1f);
+		glClearDepth(0d);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	}
+
+	private SkyboxTexture getActiveSkybox()
+	{
+		if (isCaveSkybox() && caveSkybox.texture != -1)
+		{
+			return caveSkybox;
+		}
+
+		return overworldSkybox;
+	}
+
+	private boolean isCaveSkybox()
+	{
+		Player player = client.getLocalPlayer();
+		if (player == null)
+		{
+			return false;
+		}
+
+		return WorldPoint.getMirrorPoint(player.getWorldLocation(), true).getY() >= Constants.OVERWORLD_MAX_Y;
+	}
+
+	private void setFogColor(int sky, boolean drawPanoramaSkybox)
+	{
+		float red = (sky >> 16 & 0xFF) / 255f;
+		float green = (sky >> 8 & 0xFF) / 255f;
+		float blue = (sky & 0xFF) / 255f;
+		SkyboxTexture skybox = getActiveSkybox();
+
+		if (drawPanoramaSkybox && skybox.hasFogColor)
+		{
+			float exposure = config.skyboxExposure() / 100f;
+			red = exposedSkyboxColor(skybox.fogRed, exposure);
+			green = exposedSkyboxColor(skybox.fogGreen, exposure);
+			blue = exposedSkyboxColor(skybox.fogBlue, exposure);
+		}
+
+		glUniform4f(uniFogColor, red, green, blue, 1f);
+	}
+
+	private void setSkyboxFogUniforms(boolean drawPanoramaSkybox, int viewportX, int viewportY, int viewportWidth, int viewportHeight)
+	{
+		SkyboxTexture skybox = getActiveSkybox();
+		boolean useSkyboxFog = drawPanoramaSkybox && skybox.texture != -1;
+		glUniform1i(uniUseSkyboxFog, useSkyboxFog ? 1 : 0);
+		if (!useSkyboxFog)
+		{
+			return;
+		}
+
+		final GraphicsConfiguration graphicsConfiguration = clientUI.getGraphicsConfiguration();
+		final AffineTransform transform = graphicsConfiguration.getDefaultTransform();
+
+		glActiveTexture(GL_TEXTURE2);
+		glBindTexture(GL_TEXTURE_2D, skybox.texture);
+		glUniform1i(uniSkyboxFogTexture, 2);
+		glUniform4f(uniSkyboxFogViewport,
+			getScaledValue(transform.getScaleX(), viewportX),
+			getScaledValue(transform.getScaleY(), viewportY),
+			getScaledValue(transform.getScaleX(), viewportWidth),
+			getScaledValue(transform.getScaleY(), viewportHeight));
+		glUniform1f(uniSkyboxFogCameraYaw, skyboxYaw);
+		glUniform1f(uniSkyboxFogCameraPitch, skyboxPitch);
+		glUniform1f(uniSkyboxFogHorizontalFov, skyboxHorizontalFov(viewportWidth, viewportHeight));
+		glUniform1f(uniSkyboxFogAspect, viewportWidth / (float) Math.max(1, viewportHeight));
+		glUniform1f(uniSkyboxFogYawOffset, (float) Math.toRadians(config.skyboxYawOffset()));
+		glUniform1f(uniSkyboxFogPitchOffset, (float) Math.toRadians(config.skyboxPitchOffset()));
+		glUniform1f(uniSkyboxFogExposure, config.skyboxExposure() / 100f);
+		glActiveTexture(GL_TEXTURE0);
 	}
 
 	private void drawSkybox(Scene scene, int sky, float cameraX, float cameraY, float cameraZ)
@@ -983,9 +1852,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		Model skybox = scene.getSkybox();
 		if (skybox == null)
 		{
-			glClearColor((sky >> 16 & 0xFF) / 255f, (sky >> 8 & 0xFF) / 255f, (sky & 0xFF) / 255f, 1f);
-			glClearDepth(0d);
-			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+			clearScene(sky);
 			return;
 		}
 
@@ -1003,6 +1870,95 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		vaoO.draw();
 
 		glUniformMatrix4fv(uniEntityProj, false, IDENTITY);
+	}
+
+	private void drawPanoramaSkybox(int viewportWidth, int viewportHeight, float cameraPitch, float cameraYaw)
+	{
+		SkyboxTexture skybox = getActiveSkybox();
+		if (skybox.texture == -1)
+		{
+			return;
+		}
+
+		updateSkyboxAngles(cameraPitch, cameraYaw);
+
+		glDisable(GL_DEPTH_TEST);
+		glDepthMask(false);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_BLEND);
+
+		glActiveTexture(GL_TEXTURE2);
+		glBindTexture(GL_TEXTURE_2D, skybox.texture);
+		glUseProgram(glSkyboxProgram);
+		glUniform1i(uniSkyboxTexture, 2);
+		glUniform1f(uniSkyboxCameraYaw, skyboxYaw);
+		glUniform1f(uniSkyboxCameraPitch, skyboxPitch);
+		glUniform1f(uniSkyboxHorizontalFov, skyboxHorizontalFov(viewportWidth, viewportHeight));
+		glUniform1f(uniSkyboxAspect, viewportWidth / (float) Math.max(1, viewportHeight));
+		glUniform1f(uniSkyboxYawOffset, (float) Math.toRadians(config.skyboxYawOffset()));
+		glUniform1f(uniSkyboxPitchOffset, (float) Math.toRadians(config.skyboxPitchOffset()));
+		glUniform1f(uniSkyboxExposure, config.skyboxExposure() / 100f);
+
+		glBindVertexArray(vaoUiHandle);
+		glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+		glBindVertexArray(0);
+		glUseProgram(0);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glActiveTexture(GL_TEXTURE0);
+		glDepthMask(true);
+	}
+
+	private void updateSkyboxAngles(float cameraPitch, float cameraYaw)
+	{
+		if (Float.isNaN(skyboxYaw) || Float.isNaN(skyboxPitch))
+		{
+			skyboxYaw = cameraYaw;
+			skyboxPitch = cameraPitch;
+			lastSkyboxCameraYaw = cameraYaw;
+			lastSkyboxCameraPitch = cameraPitch;
+			return;
+		}
+
+		skyboxYaw -= angleDelta(cameraYaw, lastSkyboxCameraYaw) * SKYBOX_YAW_COUNTER_ROTATION;
+		skyboxPitch += (cameraPitch - lastSkyboxCameraPitch) * SKYBOX_PITCH_COUNTER_ROTATION;
+		lastSkyboxCameraYaw = cameraYaw;
+		lastSkyboxCameraPitch = cameraPitch;
+	}
+
+	private float skyboxHorizontalFov(int viewportWidth, int viewportHeight)
+	{
+		float currentScale = Math.max(1f, client.getScale());
+		if (Float.isNaN(skyboxReferenceScale)
+			|| skyboxReferenceViewportWidth != viewportWidth
+			|| skyboxReferenceViewportHeight != viewportHeight)
+		{
+			skyboxReferenceScale = currentScale;
+			skyboxReferenceViewportWidth = viewportWidth;
+			skyboxReferenceViewportHeight = viewportHeight;
+		}
+		else
+		{
+			skyboxReferenceScale = Math.min(skyboxReferenceScale, currentScale);
+		}
+
+		float configuredHalfFov = (float) Math.toRadians(config.skyboxHorizontalFov()) * 0.5f;
+		float effectiveHalfFov = (float) Math.atan(Math.tan(configuredHalfFov) * skyboxReferenceScale / currentScale);
+		return Math.max((float) Math.toRadians(5), Math.min((float) Math.toRadians(175), effectiveHalfFov * 2f));
+	}
+
+	private static float angleDelta(float current, float previous)
+	{
+		float delta = current - previous;
+		while (delta > Math.PI)
+		{
+			delta -= Math.PI * 2f;
+		}
+		while (delta < -Math.PI)
+		{
+			delta += Math.PI * 2f;
+		}
+		return delta;
 	}
 
 	@Override
