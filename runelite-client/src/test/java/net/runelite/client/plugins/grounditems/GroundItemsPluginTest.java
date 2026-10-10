@@ -93,6 +93,10 @@ public class GroundItemsPluginTest
 
 	@Mock
 	@Bind
+	private GroundItemsTileOverlay tileOverlay;
+
+	@Mock
+	@Bind
 	private Notifier notifier;
 
 	@Mock

@@ -44,6 +44,7 @@ import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javax.annotation.Nullable;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.AccessLevel;
@@ -63,6 +64,7 @@ import static net.runelite.api.TileItem.OWNERSHIP_GROUP;
 import static net.runelite.api.TileItem.OWNERSHIP_OTHER;
 import static net.runelite.api.TileItem.OWNERSHIP_SELF;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.FocusChanged;
@@ -172,6 +174,9 @@ public class GroundItemsPlugin extends Plugin
 	private GroundItemsOverlay overlay;
 
 	@Inject
+	private GroundItemsTileOverlay tileOverlay;
+
+	@Inject
 	private Notifier notifier;
 
 	@Inject
@@ -197,6 +202,7 @@ public class GroundItemsPlugin extends Plugin
 	@Override
 	protected void startUp()
 	{
+		overlayManager.add(tileOverlay);
 		overlayManager.add(overlay);
 		mouseManager.registerMouseListener(mouseAdapter);
 		keyManager.registerKeyListener(hotkeyListener);
@@ -208,6 +214,7 @@ public class GroundItemsPlugin extends Plugin
 	protected void shutDown()
 	{
 		overlayManager.remove(overlay);
+		overlayManager.remove(tileOverlay);
 		mouseManager.unregisterMouseListener(mouseAdapter);
 		keyManager.unregisterKeyListener(hotkeyListener);
 		collectedGroundItems.clear();
@@ -872,6 +879,42 @@ public class GroundItemsPlugin extends Plugin
 	void unsetItemColor(int itemId)
 	{
 		configManager.unsetConfiguration(GroundItemsConfig.GROUP, HIGHLIGHT_COLOR_PREFIX + itemId);
+	}
+
+	/**
+	 * Returns where an item should be drawn by the ground item overlays, or null if it should not be drawn.
+	 */
+	@Nullable
+	LocalPoint getDisplayPoint(GroundItem item, LocalPoint playerLocation, OwnershipFilterMode ownershipFilterMode, int accountType)
+	{
+		final WorldView wv = item.getItemLayer().getWorldView();
+		final LocalPoint groundPoint = LocalPoint.fromWorld(wv, item.getItemLayer().getWorldLocation());
+
+		if (groundPoint == null
+			|| (groundPoint.getWorldView() == WorldView.TOPLEVEL && playerLocation.distanceTo(groundPoint) > GroundItemsOverlay.MAX_DISTANCE)
+			|| !shouldDisplayItem(ownershipFilterMode, item.getOwnership(), accountType))
+		{
+			return null;
+		}
+
+		updateItemColor(item);
+
+		if (!item.highlighted && !hotKeyPressed)
+		{
+			// Do not display hidden items
+			if (item.hidden)
+			{
+				return null;
+			}
+
+			// Do not display non-highlighted items
+			if (config.showHighlightedOnly())
+			{
+				return null;
+			}
+		}
+
+		return groundPoint;
 	}
 
 	/*

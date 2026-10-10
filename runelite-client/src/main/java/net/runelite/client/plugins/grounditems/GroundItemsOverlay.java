@@ -29,7 +29,6 @@ import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FontMetrics;
 import java.awt.Graphics2D;
-import java.awt.Polygon;
 import java.awt.Rectangle;
 import java.time.Instant;
 import java.util.AbstractMap.SimpleEntry;
@@ -42,7 +41,6 @@ import net.runelite.api.Client;
 import net.runelite.api.Perspective;
 import net.runelite.api.Player;
 import net.runelite.api.Point;
-import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.ItemID;
@@ -55,7 +53,6 @@ import net.runelite.client.plugins.grounditems.config.PriceDisplayMode;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.OverlayUtil;
 import net.runelite.client.ui.overlay.components.BackgroundComponent;
 import net.runelite.client.ui.overlay.components.ProgressPieComponent;
 import net.runelite.client.ui.overlay.components.TextComponent;
@@ -63,7 +60,7 @@ import net.runelite.client.util.QuantityFormatter;
 
 public class GroundItemsOverlay extends Overlay
 {
-	private static final int MAX_DISTANCE = 2500;
+	static final int MAX_DISTANCE = 2500;
 	// We must offset the text on the z-axis such that
 	// it doesn't obscure the ground items below it.
 	private static final int OFFSET_Z = 20;
@@ -89,6 +86,8 @@ public class GroundItemsOverlay extends Overlay
 	{
 		setPosition(OverlayPosition.DYNAMIC);
 		setLayer(OverlayLayer.ABOVE_SCENE);
+		// Draw labels after GroundItemsTileOverlay so they are never covered by tile highlights
+		setPriority(PRIORITY_HIGH);
 		this.client = client;
 		this.plugin = plugin;
 		this.config = config;
@@ -171,6 +170,11 @@ public class GroundItemsOverlay extends Overlay
 		plugin.setHiddenBoxBounds(null);
 		plugin.setHighlightBoxBounds(null);
 
+		if (dontShowOverlay)
+		{
+			return null;
+		}
+
 		final LocalPoint localLocation = player.getLocalLocation();
 		final DespawnTimerMode groundItemTimers = config.groundItemTimers();
 		final boolean outline = config.textOutline();
@@ -179,49 +183,13 @@ public class GroundItemsOverlay extends Overlay
 
 		for (GroundItem item : groundItemList)
 		{
-			final WorldView wv = item.getItemLayer().getWorldView();
-			final LocalPoint groundPoint = LocalPoint.fromWorld(wv, item.getItemLayer().getWorldLocation());
-
-			if (groundPoint == null
-				|| (groundPoint.getWorldView() == WorldView.TOPLEVEL && localLocation.distanceTo(groundPoint) > MAX_DISTANCE)
-				|| !plugin.shouldDisplayItem(ownershipFilterMode, item.getOwnership(), accountType))
+			final LocalPoint groundPoint = plugin.getDisplayPoint(item, localLocation, ownershipFilterMode, accountType);
+			if (groundPoint == null)
 			{
 				continue;
-			}
-
-			plugin.updateItemColor(item);
-
-			if (!item.highlighted && !plugin.isHotKeyPressed())
-			{
-				// Do not display hidden items
-				if (item.hidden)
-				{
-					continue;
-				}
-
-				// Do not display non-highlighted items
-				if (config.showHighlightedOnly())
-				{
-					continue;
-				}
 			}
 
 			final Color color = item.color;
-
-			if (config.highlightTiles())
-			{
-				final Polygon poly = Perspective.getCanvasTilePoly(client, groundPoint, item.getItemLayer().getHeight());
-
-				if (poly != null)
-				{
-					OverlayUtil.renderPolygon(graphics, poly, color);
-				}
-			}
-
-			if (dontShowOverlay)
-			{
-				continue;
-			}
 
 			itemStringBuilder.append(item.getName());
 
